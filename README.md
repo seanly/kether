@@ -153,6 +153,16 @@ go run ./cmd/twonode
 
 成功时标准输出含 `public <agent-id>`、`grant <agent-id>` 和 `ok`。公开路径：种子发布 `echo`，对方 `Search` 后付 1000 msat 并得到回显。授权路径：`Search` 找不到该 ID，无授权调用得到错误码 2，签发一小时授权后再次调用得到回显。
 
+`cmd/kagent` 是独立模块。`serve` 入网并发布类型 `agent`，默认用 devkit 回答；`--echo` 原样返回正文。`ask` 用种子地址搜索后调用。
+
+```bash
+go run -C cmd/kagent . serve --echo
+go run -C cmd/kagent . ask --seed <addr> ping
+go run -C cmd/kagent . serve --listen /ip4/0.0.0.0/tcp/4001 --announce /ip4/<公网IP>/tcp/4001/p2p/<PeerID>
+```
+
+调用方把 announce 地址当作 `--seed`。两边都在 NAT 后面时拨不通。
+
 ## 包
 
 | 包 | 职责 |
