@@ -161,7 +161,7 @@ go run -C cmd/kagent . ask --seed <addr> ping
 go run -C cmd/kagent . serve --listen /ip4/0.0.0.0/tcp/4001 --announce /ip4/<公网IP>/tcp/4001/p2p/<PeerID>
 ```
 
-调用方把 announce 地址当作 `--seed`。两边都在 NAT 后面时拨不通。
+调用方把 announce 地址当作 `--seed`。公网种子与 NAT 主机的步骤见 [docs/kagent.md](docs/kagent.md)。
 
 ## 包
 
@@ -193,6 +193,7 @@ make fmt
 
 | 文档 | 内容 |
 |---|---|
-| [docs/design.md](docs/design.md) | 字段、帧、签名域、调用顺序 |
+| [docs/design.md](docs/design.md) | 字段、帧、签名域、调用顺序、公网可达性 |
+| [docs/kagent.md](docs/kagent.md) | 公网种子与 NAT 主机的 kagent 步骤 |
 | [docs/issues/README.md](docs/issues/README.md) | 实施顺序与完成状态 |
 | [AGENTS.md](AGENTS.md) | 给改代码的代理用的索引 |

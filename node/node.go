@@ -10,6 +10,7 @@ import (
 
 	"github.com/libp2p/go-libp2p"
 	kaddht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
@@ -54,6 +55,11 @@ type Config struct {
 	Payer      pay.Payer
 	MaxPayMsat uint64
 	TTL        time.Duration
+	// Reachability selects public relay, private NAT, or automatic behavior.
+	Reachability Reachability
+	// OnAddrs is called when the published address set changes after the first publish.
+	// It must not call Close.
+	OnAddrs func([]string)
 }
 
 type Peer struct {
@@ -142,10 +148,10 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	h, err := libp2p.New(
+	h, err := libp2p.New(append([]libp2p.Option{
 		libp2p.Identity(lp),
 		libp2p.ListenAddrStrings(cfg.Listen...),
-	)
+	}, hostOptions(cfg)...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -182,25 +188,46 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		n.shutdown()
 		return nil, err
 	}
-	n.host.SetStreamHandler(protoID, n.onStream)
-	if len(cfg.Seeds) > 0 {
-		if err := n.dialSeeds(ctx); err != nil {
-			n.shutdown()
-			return nil, err
-		}
-	}
-	if err := n.publish(ctx); err != nil {
+	addrSub, err := h.EventBus().Subscribe(new(event.EvtLocalAddressesUpdated))
+	if err != nil {
 		n.shutdown()
 		return nil, err
 	}
-	go n.refresh()
+	reachSub, err := h.EventBus().Subscribe(new(event.EvtLocalReachabilityChanged))
+	if err != nil {
+		addrSub.Close()
+		n.shutdown()
+		return nil, err
+	}
+	started := make(chan struct{})
+	go n.refresh(addrSub, reachSub, started)
+	fail := func(err error) (*Node, error) {
+		n.cancel()
+		<-n.exited
+		n.shutdown()
+		return nil, err
+	}
+	n.host.SetStreamHandler(protoID, n.onStream)
+	if len(cfg.Seeds) > 0 {
+		if err := n.dialSeeds(ctx); err != nil {
+			return fail(err)
+		}
+	}
+	if err := n.publish(ctx); err != nil {
+		return fail(err)
+	}
+	close(started)
 	return n, nil
 }
 
 func (n *Node) signLocked(now time.Time) error {
-	addrs := n.cfg.Record.Addrs
+	var previous []string
+	if n.rec != nil {
+		previous = n.rec.Addrs
+	}
+	addrs := chooseAddrs(n.cfg.Reachability, n.cfg.Record.Addrs, n.Addrs(), previous)
 	if len(addrs) == 0 {
-		addrs = n.Addrs()
+		return errors.New("kether: record has no address")
 	}
 	pay := make([]record.PayMethod, len(n.cfg.Record.Pay))
 	for i, p := range n.cfg.Record.Pay {
@@ -297,28 +324,66 @@ func (n *Node) dialSeeds(ctx context.Context) error {
 	return nil
 }
 
-func (n *Node) refresh() {
+func (n *Node) refresh(addrSub, reachSub event.Subscription, started <-chan struct{}) {
 	defer close(n.exited)
+	defer addrSub.Close()
+	defer reachSub.Close()
 	interval := n.cfg.TTL / 2
 	if interval < time.Second {
 		interval = time.Second
 	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	arm := started
 	for {
 		select {
 		case <-n.ctx.Done():
 			return
+		case <-arm:
+			arm = nil
+			n.republishIfChanged()
+		case <-addrSub.Out():
+			if arm == nil {
+				n.republishIfChanged()
+			}
+		case <-reachSub.Out():
+			if arm == nil {
+				n.republishIfChanged()
+			}
 		case <-t.C:
-			n.mu.Lock()
-			n.seq++
-			err := n.signLocked(time.Now())
-			n.mu.Unlock()
-			if err != nil {
+			if arm != nil {
 				continue
 			}
-			_ = n.publish(n.ctx)
+			n.bumpAndPublish()
 		}
+	}
+}
+
+// republishIfChanged signs and publishes only when the address set differs.
+func (n *Node) republishIfChanged() {
+	n.mu.Lock()
+	previous := append([]string(nil), n.rec.Addrs...)
+	next := chooseAddrs(n.cfg.Reachability, n.cfg.Record.Addrs, n.Addrs(), previous)
+	n.mu.Unlock()
+	if sameAddrs(previous, next) {
+		return
+	}
+	n.bumpAndPublish()
+}
+
+func (n *Node) bumpAndPublish() {
+	n.mu.Lock()
+	before := append([]string(nil), n.rec.Addrs...)
+	n.seq++
+	err := n.signLocked(time.Now())
+	after := append([]string(nil), n.rec.Addrs...)
+	n.mu.Unlock()
+	if err != nil {
+		return
+	}
+	_ = n.publish(n.ctx)
+	if n.cfg.OnAddrs != nil && !sameAddrs(before, after) {
+		n.cfg.OnAddrs(after)
 	}
 }
 
@@ -342,6 +407,15 @@ func (n *Node) shutdown() error {
 }
 
 func (n *Node) ID() string { return n.agentID }
+
+// PublishedAddrs returns the addresses in the current signed record.
+func (n *Node) PublishedAddrs() []string {
+	rec := n.current()
+	if rec == nil {
+		return nil
+	}
+	return append([]string(nil), rec.Addrs...)
+}
 
 func (n *Node) Addrs() []string {
 	if n.host == nil {

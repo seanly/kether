@@ -2,6 +2,8 @@ package node
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -107,7 +109,7 @@ func TestRecordTooBig(t *testing.T) {
 	ctx := testCtx(t)
 	fat := make([]string, 8)
 	for i := range fat {
-		fat[i] = "/ip4/127.0.0.1/tcp/1/p2p/" + string(make([]byte, 1200))
+		fat[i] = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d/p2p/%s", i+1, strings.Repeat("a", 1200))
 	}
 	_, err := Start(ctx, Config{
 		Key:    mustKey(t),

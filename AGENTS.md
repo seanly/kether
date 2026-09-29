@@ -7,7 +7,7 @@
 
 ## 状态
 
-0001–0011 已完成：身份、签名记录、入网、发现、握手、授权、Lightning 与链上 Bitcoin 打桩支付、调用状态机、`cmd/twonode`。
+0001–0012 已完成：身份、签名记录、入网、发现、握手、授权、Lightning 与链上 Bitcoin 打桩支付、调用状态机、`cmd/twonode`、公网可达性（AutoNAT、中继、打洞）。
 
 ## 快速开始
 
@@ -50,6 +50,7 @@ go test ./cmd/twonode
 | 看某段是否已交付 | [`docs/issues/README.md`](docs/issues/README.md) 的状态列，再打开对应 issue |
 | 嵌入宿主 | 根包 `kether.Start`。业务只注册 `Handle` |
 | 本地跑通公开与仅授权 | `cmd/twonode` |
+| 公网种子与 NAT 主机 | [`docs/design.md`](docs/design.md) 的「公网可达性」，操作见 [`docs/kagent.md`](docs/kagent.md) |
 
 ## 约定
 

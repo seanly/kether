@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/seanly/kether"
 )
 
 func TestEchoTwoNodes(t *testing.T) {
@@ -17,7 +19,7 @@ func TestEchoTwoNodes(t *testing.T) {
 	}
 	defer srv.Close()
 
-	body, err := callAgent(ctx, "", srv.Node.Addrs(), "ping")
+	body, err := callAgent(ctx, "", srv.Node.Addrs(), "", "ping")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,8 +121,55 @@ func TestAnnouncePassedThrough(t *testing.T) {
 	if peer.ID != srv.Node.ID() {
 		t.Fatalf("found %s", peer.ID)
 	}
-	if len(peer.Addrs) != 1 || peer.Addrs[0] != ann {
+	if len(peer.Addrs) == 0 || peer.Addrs[0] != ann {
 		t.Fatalf("addrs %q", peer.Addrs)
+	}
+}
+
+func TestAnnounceAddsPeerID(t *testing.T) {
+	key, err := loadKey("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := completeAnnounce(key, []string{"/ip4/203.0.113.5/tcp/4001"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := key.Public().PeerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "/ip4/203.0.113.5/tcp/4001/p2p/" + pid.String()
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("announce %q", got)
+	}
+}
+
+func TestServeSeedAndAskID(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	seed, err := startServer(ctx, serveConfig{Echo: true, Public: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer seed.Close()
+	if len(seed.Node.Addrs()) == 0 {
+		t.Fatal("seed has no address")
+	}
+	other, err := startServer(ctx, serveConfig{Echo: true, Seeds: seed.Node.Addrs()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	other.Node.Handle(func(_ context.Context, c kether.Call) (kether.Result, error) {
+		return kether.Result{Body: []byte("from-other")}, nil
+	})
+	body, err := callAgent(ctx, "", seed.Node.Addrs(), other.Node.ID(), "ping")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "from-other" {
+		t.Fatalf("body %q", body)
 	}
 }
 

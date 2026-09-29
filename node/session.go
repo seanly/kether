@@ -46,7 +46,7 @@ func (n *Node) Connect(ctx context.Context, agentID string) (*Session, error) {
 	}
 	var last error
 	var ai *peer.AddrInfo
-	for _, addr := range remote.Addrs {
+	for _, addr := range orderDialAddrs(remote.Addrs) {
 		got, err := peer.AddrInfoFromString(addr)
 		if err != nil {
 			last = err
