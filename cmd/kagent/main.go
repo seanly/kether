@@ -1,6 +1,6 @@
 // Command kagent is a CLI agent. serve joins the kether network and answers
-// calls with devkit, or echoes the body when --echo is set. ask dials a seed,
-// searches for type "agent", and prints the reply.
+// calls with devkit, or echoes the body when --echo is set. ask dials a
+// host:port seed and prints the reply.
 package main
 
 import (
@@ -40,8 +40,8 @@ func main() {
 	}
 }
 
-const usage = `kagent serve [--key path] [--listen addr] [--announce addr] [--seed addr] [--public] [--echo]
-kagent ask --seed addr [--id agent] [--key path] <prompt>`
+const usage = `kagent serve [--key path] [--seed host:port] [--echo]
+kagent ask --seed host:port [--id uuid] [--key path] <prompt>`
 
 var errUsage = errors.New("usage")
 
@@ -55,13 +55,10 @@ func (s *stringList) Set(v string) error {
 }
 
 type serveConfig struct {
-	Key      string
-	Listen   []string
-	Announce []string
-	Seeds    []string
-	Public   bool
-	Echo     bool
-	OnAddrs  func([]string)
+	Key    string
+	Listen []string
+	Seeds  []string
+	Echo   bool
 }
 
 func run(ctx context.Context, args []string, w io.Writer) error {
@@ -84,13 +81,10 @@ func runServe(ctx context.Context, args []string, w io.Writer) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var key string
-	var listen, announce, seeds stringList
-	var echo, public bool
+	var seeds stringList
+	var echo bool
 	fs.StringVar(&key, "key", "", "private key file (0600); created if missing")
-	fs.Var(&listen, "listen", "libp2p listen multiaddr (repeatable)")
-	fs.Var(&announce, "announce", "address published in the record (repeatable)")
-	fs.Var(&seeds, "seed", "seed multiaddr (repeatable)")
-	fs.BoolVar(&public, "public", false, "run as a public seed, AutoNAT dial-back, and relay")
+	fs.Var(&seeds, "seed", "seed host:port (repeatable)")
 	fs.BoolVar(&echo, "echo", false, "return the request body unchanged")
 	if err := fs.Parse(args); err != nil {
 		return errUsage
@@ -99,58 +93,26 @@ func runServe(ctx context.Context, args []string, w io.Writer) error {
 		return errUsage
 	}
 	srv, err := startServer(ctx, serveConfig{
-		Key: key, Listen: listen, Announce: announce, Seeds: seeds,
-		Public: public, Echo: echo,
-		OnAddrs: func(addrs []string) {
-			for _, addr := range addrs {
-				fmt.Fprintf(w, "addr %s\n", addr)
-			}
-		},
+		Key: key, Listen: defaultListen(), Seeds: seeds, Echo: echo,
 	})
 	if err != nil {
 		return err
 	}
 	defer srv.Close()
-	if err := writeReady(w, srv.Node.ID(), readyAddrs(srv.Node)); err != nil {
+	if err := writeReady(w, srv.Node.ID()); err != nil {
 		return err
 	}
 	<-ctx.Done()
 	return nil
 }
 
-func readyAddrs(n *kether.Node) []string {
-	if addrs := n.PublishedAddrs(); len(addrs) > 0 {
-		return addrs
-	}
-	return n.Addrs()
+func defaultListen() []string {
+	return []string{"/ip4/0.0.0.0/tcp/0", "/ip4/0.0.0.0/udp/0/quic-v1"}
 }
 
-func completeAnnounce(key *id.PrivateKey, addrs []string) ([]string, error) {
-	pid, err := key.Public().PeerID()
-	if err != nil {
-		return nil, err
-	}
-	suffix := "/p2p/" + pid.String()
-	out := make([]string, 0, len(addrs))
-	for _, addr := range addrs {
-		if !strings.Contains(addr, "/p2p/") {
-			addr += suffix
-		}
-		out = append(out, addr)
-	}
-	return out, nil
-}
-
-func writeReady(w io.Writer, agentID string, addrs []string) error {
-	if _, err := fmt.Fprintf(w, "id %s\n", agentID); err != nil {
-		return err
-	}
-	for _, a := range addrs {
-		if _, err := fmt.Fprintf(w, "addr %s\n", a); err != nil {
-			return err
-		}
-	}
-	return nil
+func writeReady(w io.Writer, uuid string) error {
+	_, err := fmt.Fprintf(w, "uuid %s\n", uuid)
+	return err
 }
 
 func runAsk(ctx context.Context, args []string, w io.Writer) error {
@@ -159,8 +121,8 @@ func runAsk(ctx context.Context, args []string, w io.Writer) error {
 	var key, agentID string
 	var seeds stringList
 	fs.StringVar(&key, "key", "", "private key file (0600); created if missing")
-	fs.StringVar(&agentID, "id", "", "agent id to call; searched by type when empty")
-	fs.Var(&seeds, "seed", "seed multiaddr (repeatable)")
+	fs.StringVar(&agentID, "id", "", "uuid to call; searched by type when empty")
+	fs.Var(&seeds, "seed", "seed host:port (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return errUsage
 	}
@@ -208,26 +170,14 @@ func startServer(ctx context.Context, cfg serveConfig) (*server, error) {
 		}
 		srv.kit = kit
 	}
-	announce, err := completeAnnounce(key, cfg.Announce)
-	if err != nil {
-		srv.Close()
-		return nil, err
-	}
-	reach := kether.ReachabilityAuto
-	if cfg.Public {
-		reach = kether.ReachabilityPublic
-	}
 	node, err := kether.Start(ctx, kether.Config{
-		Key:          key,
-		Listen:       cfg.Listen,
-		Seeds:        cfg.Seeds,
-		Reachability: reach,
-		OnAddrs:      cfg.OnAddrs,
+		Key:    key,
+		Listen: cfg.Listen,
+		Seeds:  cfg.Seeds,
 		Record: kether.Record{
 			Name:   "kagent",
 			Types:  []string{typeAgent},
 			Access: kether.AccessPublic,
-			Addrs:  announce,
 		},
 	})
 	if err != nil {

@@ -1,6 +1,6 @@
 # Kether
 
-Kether 是一套点对点 Agent 网络的协议和 Go 库。进程调用 `kether.Start` 即入网：用 secp256k1 密钥得到可抄送的 Agent ID，发布签名记录，按类型或 ID 发现对方，在授权和支付通过之后才执行宿主的处理函数。
+Kether 是一套点对点 Agent 网络的协议和 Go 库。进程调用 `kether.Start` 即入网：用密钥文件里的 UUID 作为可抄送的 Agent ID，发布签名记录，按类型或 ID 发现对方，在授权和支付通过之后才执行宿主的处理函数。
 
 读音与 Zether、Xether 同一型，词义是「冠」。模块路径 `github.com/seanly/kether`。
 
@@ -10,7 +10,7 @@ Kether 是一套点对点 Agent 网络的协议和 Go 库。进程调用 `kether
 
 调用另一个 Agent 通常要事先写死 URL。地址一变就断，服务方也分不清调用者，更没法按次收费。Kether 把这三件事收进同一套记录：
 
-- **稳定身份。** Agent ID 是 `keth1…`，由 x-only 公钥做 bech32m（HRP `keth`，版本字节 `0x00`）。同一把公钥导出 libp2p Peer ID。
+- **稳定身份。** Agent ID 是创建密钥时生成的 UUID。同一把 secp256k1 密钥签名，并导出 libp2p Peer ID。
 - **发现。** `Search(type)` 只返回 `public` 且声明了该类型的 Agent。`Resolve(id)` 按 ID 取最新验签记录，`grant_only` 也能解析，但不会出现在类型索引里。
 - **先验证再执行。** `grant_only` 必须带对该 ID 签发的授权。记录标了价就必须先通过支付回执。`Handle` 只在这两步通过之后运行。
 
@@ -26,7 +26,7 @@ flowchart LR
 
 ## 状态
 
-[0001–0011](docs/issues/README.md) 已完成：身份、签名记录、入网、发现、握手、授权、Lightning 与链上 Bitcoin 的进程内打桩支付、调用状态机、`cmd/twonode`。
+[0001–0014](docs/issues/README.md) 已完成：身份、签名记录、入网、发现、握手、授权、Lightning 与链上 Bitcoin 的进程内打桩支付、调用状态机、`cmd/twonode`、公网可达性、UUID 入网、独立公网中继 `cmd/kether`。
 
 字段、帧和签名域以 [docs/design.md](docs/design.md) 为准。尚未实现的包括真实 LND / Core Lightning 客户端、BOLT12、授权撤销在 DHT 上的传播，以及次数上限的全局计数。`max_calls` 只在单个服务进程的内存里递减。
 
@@ -69,7 +69,7 @@ defer node.Close()
 node.Handle(func(_ context.Context, call kether.Call) (kether.Result, error) {
     return kether.Result{Body: call.Body}, nil
 })
-fmt.Println(node.ID(), node.Addrs())
+fmt.Println(node.ID())
 ```
 
 调用方以服务方地址为种子入网，搜索后调用。记录带价时必须提供 `Payer`。`MaxPayMsat` 超过本地上限时库不会调用 `Payer`。
@@ -153,22 +153,22 @@ go run ./cmd/twonode
 
 成功时标准输出含 `public <agent-id>`、`grant <agent-id>` 和 `ok`。公开路径：种子发布 `echo`，对方 `Search` 后付 1000 msat 并得到回显。授权路径：`Search` 找不到该 ID，无授权调用得到错误码 2，签发一小时授权后再次调用得到回显。
 
-`cmd/kagent` 是独立模块。`serve` 入网并发布类型 `agent`，默认用 devkit 回答；`--echo` 原样返回正文。`ask` 用种子地址搜索后调用。
+`cmd/kether` 是公网中继，监听 `0.0.0.0:4001` 的 TCP 和 QUIC。`cmd/kagent` 是独立模块。`serve` 入网并发布类型 `agent`，默认用 devkit 回答；`--echo` 原样返回正文。标准输出是一行 `uuid`。`ask --id` 调用指定 UUID。
 
 ```bash
-go run -C cmd/kagent . serve --echo
-go run -C cmd/kagent . ask --seed <addr> ping
-go run -C cmd/kagent . serve --listen /ip4/0.0.0.0/tcp/4001 --announce /ip4/<公网IP>/tcp/4001/p2p/<PeerID>
+go run ./cmd/kether --key vps.key
+go run -C cmd/kagent . serve --echo --key agent.key --seed 203.0.113.10:4001
+go run -C cmd/kagent . ask --key caller.key --seed 203.0.113.10:4001 --id <uuid> ping
 ```
 
-调用方把 announce 地址当作 `--seed`。公网种子与 NAT 主机的步骤见 [docs/kagent.md](docs/kagent.md)。
+公网中继与 NAT 主机的步骤见 [docs/kagent.md](docs/kagent.md)。
 
 ## 包
 
 | 包 | 职责 |
 |---|---|
 | `kether` | `Start` 与公共类型别名 |
-| `id` | 密钥、bech32m Agent ID、BIP340 |
+| `id` | 密钥、UUID、BIP340 |
 | `record` | 签名记录的编码与验签 |
 | `dht` | DHT 键与 namespace validator |
 | `node` | 入网、发布、搜索、连接、调用 |
@@ -177,6 +177,7 @@ go run -C cmd/kagent . serve --listen /ip4/0.0.0.0/tcp/4001 --announce /ip4/<公
 | `pay` | 支付接口、`MemLightning`、`MemChain` |
 | `frame` | 长度前缀帧，上限 1 MiB |
 | `cmd/twonode` | 本地双路径演示 |
+| `cmd/kether` | 公网中继，监听 `0.0.0.0:4001` |
 
 ## 开发
 
@@ -194,6 +195,6 @@ make fmt
 | 文档 | 内容 |
 |---|---|
 | [docs/design.md](docs/design.md) | 字段、帧、签名域、调用顺序、公网可达性 |
-| [docs/kagent.md](docs/kagent.md) | 公网种子与 NAT 主机的 kagent 步骤 |
+| [docs/kagent.md](docs/kagent.md) | 公网中继 `cmd/kether` 与 NAT 上的 kagent |
 | [docs/issues/README.md](docs/issues/README.md) | 实施顺序与完成状态 |
 | [AGENTS.md](AGENTS.md) | 给改代码的代理用的索引 |

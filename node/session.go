@@ -14,6 +14,7 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 
 	"github.com/seanly/kether/auth"
 	"github.com/seanly/kether/frame"
@@ -23,11 +24,12 @@ import (
 )
 
 type Session struct {
-	node   *Node
-	s      network.Stream
-	remote Peer
-	mu     sync.Mutex
-	next   atomic.Uint64
+	node      *Node
+	s         network.Stream
+	remote    Peer
+	remotePub *id.Public
+	mu        sync.Mutex
+	next      atomic.Uint64
 }
 
 type Request struct {
@@ -37,40 +39,30 @@ type Request struct {
 }
 
 func (n *Node) Connect(ctx context.Context, agentID string) (*Session, error) {
-	remote, err := n.Resolve(ctx, agentID)
+	rec, err := n.lookup(ctx, agentID)
 	if err != nil {
 		return nil, err
 	}
-	if len(remote.Addrs) == 0 {
-		return nil, errors.New("kether: record has no address")
-	}
-	var last error
-	var ai *peer.AddrInfo
-	for _, addr := range orderDialAddrs(remote.Addrs) {
-		got, err := peer.AddrInfoFromString(addr)
-		if err != nil {
-			last = err
-			continue
-		}
-		ai = got
-		if err := n.host.Connect(ctx, *ai); err != nil {
-			last = err
-			ai = nil
-			continue
-		}
-		break
-	}
-	if ai == nil {
-		if last == nil {
-			last = errors.New("no address")
-		}
-		return nil, last
-	}
-	s, err := n.host.NewStream(ctx, ai.ID, protoID)
+	pid, err := peer.Decode(rec.PeerID)
 	if err != nil {
 		return nil, err
 	}
-	sess := &Session{node: n, s: s, remote: remote}
+	pub, err := id.ParseXOnly(rec.Pubkey)
+	if err != nil {
+		return nil, err
+	}
+	info, err := n.dialInfo(ctx, pid)
+	if err != nil {
+		return nil, err
+	}
+	if err := n.host.Connect(ctx, info); err != nil {
+		return nil, err
+	}
+	s, err := n.host.NewStream(ctx, pid, protoID)
+	if err != nil {
+		return nil, err
+	}
+	sess := &Session{node: n, s: s, remote: peerFrom(rec), remotePub: pub}
 	if err := sess.handshakeClient(ctx); err != nil {
 		s.Close()
 		return nil, err
@@ -78,15 +70,51 @@ func (n *Node) Connect(ctx context.Context, agentID string) (*Session, error) {
 	return sess, nil
 }
 
+// dialInfo asks the DHT for the peer, then falls back to addresses already
+// learned from a seed dial. Direct addresses are tried before circuit addresses.
+func (n *Node) dialInfo(ctx context.Context, pid peer.ID) (peer.AddrInfo, error) {
+	info, ferr := n.dht.FindPeer(ctx, pid)
+	if ferr != nil || len(info.Addrs) == 0 {
+		info = n.host.Peerstore().PeerInfo(pid)
+	}
+	if len(info.Addrs) == 0 {
+		if ferr == nil {
+			ferr = errors.New("kether: peer has no address")
+		}
+		return peer.AddrInfo{}, ferr
+	}
+	info.ID = pid
+	info.Addrs = orderMultiaddrs(info.Addrs)
+	return info, nil
+}
+
+func orderMultiaddrs(in []ma.Multiaddr) []ma.Multiaddr {
+	raw := make([]string, len(in))
+	for i, addr := range in {
+		raw[i] = addr.String()
+	}
+	raw = orderDialAddrs(raw)
+	out := make([]ma.Multiaddr, 0, len(raw))
+	for _, addr := range raw {
+		m, err := ma.NewMultiaddr(addr)
+		if err != nil {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
 func (s *Session) Close() error { return s.s.Close() }
 
 func (n *Node) onStream(s network.Stream) {
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(30 * time.Second))
-	if err := n.handshakeServer(s); err != nil {
+	callerID, err := n.handshakeServer(s)
+	if err != nil {
 		return
 	}
-	callerPub, callerID, err := peerIdentity(s)
+	callerPub, err := xonlyFromConn(s)
 	if err != nil {
 		return
 	}
@@ -99,35 +127,44 @@ func (n *Node) onStream(s network.Stream) {
 	}
 }
 
-func (n *Node) handshakeServer(s network.Stream) error {
+func (n *Node) handshakeServer(s network.Stream) (string, error) {
 	nonceS := make([]byte, 32)
 	if _, err := rand.Read(nonceS); err != nil {
-		return err
+		return "", err
 	}
 	if err := frame.Write(s, &frame.Envelope{Kind: frame.KindHello, Hello: frame.Hello{AgentID: n.agentID, Nonce: nonceS}}); err != nil {
-		return err
+		return "", err
 	}
 	env, err := frame.Read(s)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if env.Kind != frame.KindHello {
-		return n.fail(s, 0, frame.CodeFrame, "expected hello")
+		return "", n.fail(s, 0, frame.CodeFrame, "expected hello")
 	}
-	pub, pid, err := identityOf(env.Hello.AgentID)
-	if err != nil || pid != s.Conn().RemotePeer() {
-		return n.fail(s, 0, frame.CodeVerify, "peer mismatch")
+	pub, err := pubFromConn(s)
+	if err != nil {
+		return "", n.fail(s, 0, frame.CodeVerify, "peer mismatch")
 	}
 	nonceC := env.Hello.Nonce
 	msg := helloMaterial(n.agentID, nonceS, nonceC)
 	if !id.Verify(pub, id.DomainHello, msg, env.Hello.Signature) {
-		return n.fail(s, 0, frame.CodeVerify, "bad hello signature")
+		return "", n.fail(s, 0, frame.CodeVerify, "bad hello signature")
+	}
+	lookCtx, cancel := context.WithTimeout(n.ctx, 5*time.Second)
+	defer cancel()
+	rec, err := n.lookup(lookCtx, env.Hello.AgentID)
+	if err != nil || rec.PeerID != s.Conn().RemotePeer().String() {
+		return "", n.fail(s, 0, frame.CodeVerify, "peer mismatch")
 	}
 	sig, err := id.Sign(n.key, id.DomainHello, helloMaterial(env.Hello.AgentID, nonceS, nonceC))
 	if err != nil {
-		return err
+		return "", err
 	}
-	return frame.Write(s, &frame.Envelope{Kind: frame.KindHelloAck, Ack: frame.HelloAck{Signature: sig}})
+	if err := frame.Write(s, &frame.Envelope{Kind: frame.KindHelloAck, Ack: frame.HelloAck{Signature: sig}}); err != nil {
+		return "", err
+	}
+	return env.Hello.AgentID, nil
 }
 
 func (s *Session) handshakeClient(ctx context.Context) error {
@@ -141,13 +178,10 @@ func (s *Session) handshakeClient(ctx context.Context) error {
 	if env.Kind != frame.KindHello {
 		return errors.New("kether: expected hello")
 	}
-	pub, pid, err := identityOf(env.Hello.AgentID)
-	if err != nil {
-		return err
-	}
-	if pid != s.s.Conn().RemotePeer() || env.Hello.AgentID != s.remote.ID {
+	if env.Hello.AgentID != s.remote.ID || s.s.Conn().RemotePeer().String() != s.remotePeerID() {
 		return errors.New("kether: peer mismatch")
 	}
+	pub := s.remotePub
 	nonceC := make([]byte, 32)
 	if _, err := rand.Read(nonceC); err != nil {
 		return err
@@ -183,35 +217,29 @@ func helloMaterial(remote string, nonceS, nonceC []byte) []byte {
 	return buf
 }
 
-func identityOf(agentID string) (*id.Public, peer.ID, error) {
-	pub, err := id.ParseAgentID(agentID)
+func (s *Session) remotePeerID() string {
+	pid, err := s.remotePub.PeerID()
 	if err != nil {
-		return nil, "", err
+		return ""
 	}
-	pid, err := pub.PeerID()
-	if err != nil {
-		return nil, "", err
-	}
-	return pub, pid, nil
+	return pid.String()
 }
 
-func peerIdentity(s network.Stream) ([]byte, string, error) {
-	// The remote peer id was checked during handshake. Recover the x-only key
-	// from the libp2p public key on the connection.
+func pubFromConn(s network.Stream) (*id.Public, error) {
 	pk := s.Conn().RemotePublicKey()
 	raw, err := pk.Raw()
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	pub, err := id.ParseCompressed(raw)
+	return id.ParseCompressed(raw)
+}
+
+func xonlyFromConn(s network.Stream) ([]byte, error) {
+	pub, err := pubFromConn(s)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	aid, err := pub.AgentID()
-	if err != nil {
-		return nil, "", err
-	}
-	return pub.XOnly(), aid, nil
+	return pub.XOnly(), nil
 }
 
 func (n *Node) serveInvoke(s network.Stream, callerPub []byte, callerID string, env *frame.Envelope) {
@@ -332,10 +360,7 @@ func (s *Session) Invoke(ctx context.Context, req Request) (Result, error) {
 			if s.node.cfg.MaxPayMsat > 0 && env.Challenge.Amount > s.node.cfg.MaxPayMsat {
 				return Result{}, &CallError{Code: frame.CodeBadPay, Message: "over payment cap"}
 			}
-			pub, err := id.ParseAgentID(s.remote.ID)
-			if err != nil {
-				return Result{}, err
-			}
+			pub := s.remotePub
 			wire := env.Challenge
 			sig := wire.Signature
 			wire.Signature = nil

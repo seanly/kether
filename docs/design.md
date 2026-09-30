@@ -22,7 +22,7 @@ Kether 把这三件事收成一套协议和 Go 库：
 ## 目标
 
 - 一个 Go module，嵌入宿主进程即可入网。宿主负责业务处理函数，库负责入网、发现、授权、收款。
-- Agent ID 由 secp256k1 公钥决定，与 Bitcoin、Lightning 使用同一条曲线和 BIP340 签名。
+- Agent ID 是创建密钥时生成的 UUID。签名用 secp256k1 与 BIP340，与 Bitcoin、Lightning 同一条曲线。
 - 启动后连接种子节点，发布签名记录，并能解析其他 Agent。
 - 公开记录可按类型被搜索。仅授权记录仍可按 ID 解析，但调用必须携带该 ID 签发的授权。
 - 支付失败的调用不会进入业务处理函数。
@@ -46,12 +46,12 @@ Kether 把这三件事收成一套协议和 Go 库：
 
 | 词 | 含义 |
 |----|------|
-| Agent ID | `keth1...`，x-only 公钥的 bech32m 编码 |
-| 记录 Record | 某 ID 当前的地址、类型、访问模式和支付方式，由该 ID 签名 |
+| Agent ID | 随机 UUID，文本是小写的 `8-4-4-4-12` |
+| 记录 Record | 某 ID 当前的类型、访问模式和支付方式，由持有该 ID 的密钥签名 |
 | 类型 Type | 记录上的能力标签，例如 `echo`、`translate` |
 | 授权 Grant | 所有者签给另一个 Agent ID 的调用许可 |
 | 通道 Rail | 一种支付实现，例如 `lightning`、`bitcoin` |
-| 种子 Seed | 启动时拨号的已知节点地址 |
+| 种子 Seed | 启动时拨号的 `host:port` |
 
 ## 总览
 
@@ -98,35 +98,32 @@ Bitcoin 的 P2P 网继续只转发区块和交易。Kether 使用它的曲线做
 
 ## 身份
 
-每个 Agent 一把 secp256k1 密钥。签名使用 BIP340（Schnorr，x-only 公钥 32 字节）。私钥留在本机，文件权限 `0600`。
+每个 Agent 一把 secp256k1 密钥，外加一个创建时生成一次的随机 UUID。签名使用 BIP340（Schnorr，x-only 公钥 32 字节）。私钥 32 字节和 UUID 16 字节放在同一个文件里，权限 `0600`。已有的 32 字节文件在加载时补一个 UUID 并写回。
 
-Agent ID 的编码：
+人抄的 Agent ID 就是这个 UUID，文本是小写的 `8-4-4-4-12`。它写进签名记录，和公钥、`peer_id` 一起被签上。`Node.ID()`、DHT 键 `/kether/agent/1/<uuid>`、`Hello` 和 `ask --id` 都用这个字符串。
 
-- 人类可读前缀 HRP：`keth`
-- 校验：bech32m（BIP 350）
-- 数据：1 字节版本 `0x00`，后接 32 字节 x-only 公钥
-- 版本不是 `0x00` 的 ID，当前实现拒绝
+libp2p 的 Peer ID 由同一把公钥导出，留在签名记录的 `peer_id` 里，把 UUID 绑到这条连接上。人不配置它，标准输出也不打印它。
 
-示例形态：`keth1...`。ID 可以抄给别人，当作搜索和授权的主键。
-
-libp2p 的 Peer ID 是公钥 protobuf 的多重哈希，与 `keth1...` 字符串不同。同一把公钥同时产生两者。签名记录里同时写下 Agent ID 和 Peer ID，调用方验签后再拨号。连接建立后，握手再次确认对端公钥等于记录里的公钥。
+同一把公钥仍可编码成 HRP `keth` 的 bech32m（版本字节 `0x00`）。授权校验使用记录里的 x-only 公钥。
 
 ## 节点如何入网
 
-`Start` 读取密钥和种子 multiaddr 列表，创建 libp2p Host，加入协议 ID 为 `/kether/kad/1.0.0` 的 Kademlia DHT。这个 DHT 只在 Kether 节点之间使用，不写入公共 IPFS DHT。
+`Start` 读取密钥和种子列表，创建 libp2p Host，加入协议 ID 为 `/kether/kad/1.0.0` 的 Kademlia DHT。这个 DHT 只在 Kether 节点之间使用，不写入公共 IPFS DHT。
+
+种子写成 `host:port`。程序先在 TCP 上做一次 Noise 握手，从对方公钥得到 Peer ID，再 `Connect`。已经带 `/p2p/<PeerID>` 的 multiaddr 同样可以拨，本地测试用这种形式。
 
 入网顺序：
 
-1. 拨号种子。至少一个种子可达，否则 `Start` 返回错误。
+1. 学习种子的 Peer ID 并拨号。至少一个种子可达，否则 `Start` 返回错误。
 2. 启动 DHT 路由表引导。
-3. 若配置了记录，签名并发布。地址集合变化时递增 `seq` 并重新发布。刷新周期仍是 `ExpiresAt` 的一半，刷新时也递增 `seq`。地址怎么取，见下一节。
+3. 若配置了记录，签名并发布。刷新周期是 `ExpiresAt` 的一半，刷新时递增 `seq`。
 4. 开始接受 `/kether/1.0.0` 流。
 
-本地演示可以让其中一个进程只做种子：它入网、发布自己的记录，并接受其他节点的 DHT 查询。生产环境的种子是若干长期在线的普通节点，没有单独的目录服务器角色。
+本地演示可以让其中一个进程只做种子：它入网、发布自己的记录，并接受其他节点的 DHT 查询。生产环境的公网进程是 [`cmd/kether`](../cmd/kether)，仍在这张 DHT 里，不另设目录服务器。
 
 ## 公网可达性
 
-一张网里有公网节点和 NAT 后面的节点。公网节点能被直接拨到。NAT 节点入网时只拨公网节点，调用时先经公网节点转发，打洞成功后再直连。记录字段不变。
+一张网里有公网节点和 NAT 后面的节点。公网节点能被直接拨到。NAT 节点入网时只拨公网节点的 `host:port`，调用时先经公网节点转发，打洞成功后再直连。签名记录不保存地址。
 
 操作员用 `Config.Reachability` 声明角色：
 
@@ -138,39 +135,29 @@ libp2p 的 Peer ID 是公钥 protobuf 的多重哈希，与 `keth1...` 字符串
 
 ### 多台公网节点
 
-公网节点可以有多台。每一台都是 DHT 种子、AutoNAT 回拨方和 circuit v2 中继。它们必须互相拨号，路由表才是一张。互不连接时会分成几张 DHT，`Search` 会漏记录。第一台可以空种子启动。其余每台把已经在线的公网节点写入 `Seeds`。
+公网节点可以有多台，进程是 `cmd/kether`。每一台都是 DHT 种子、AutoNAT 回拨方和 circuit v2 中继。它们不会自动互相发现。第一台空种子启动。其余每台把已经在线的中继写入 `Seeds`，拨通其中一台即加入同一张 DHT。互不连接时会分成几张 DHT，`Search` 会漏记录。
 
-NAT 节点的 `Seeds` 列出全部公网节点。`Start` 只要拨通其中一台就算入网。
+NAT 节点的 `Seeds` 列出全部公网中继。`Start` 只要拨通其中一台就算入网。中继的记录类型是 `relay`，`Search("agent")` 不会返回它。
 
-私有 DHT 里没有中继目录。静态中继只来自 `Seeds` 里能解析出 Peer ID 的 multiaddr。预约数是 `min(种子数, 2)`。记录里最多留下两条 circuit 地址：一台公网节点不在时，调用方走另一条。不向公共 IPFS DHT 发现中继。
+私有 DHT 里没有中继目录。静态中继来自 `Seeds`。`host:port` 在创建 Host 之前先学到 Peer ID。预约数是 `min(种子数, 2)`。一台公网节点不在时，调用方走另一台已经预约的中继。不向公共 IPFS DHT 发现中继。
 
-### 入网之后地址怎么变
+### 入网之后怎么找到对方
 
 1. NAT 节点直连一台公网节点，加入 `/kether/kad/1.0.0`。
 2. 公网节点按 AutoNAT 回拨。回拨失败，该节点记为私网。`private` 不做这次等待，直接进入下一步。
 3. 私网节点向最多两台公网节点预约中继槽。
-4. 预约成功后重新签名。地址形如 `/ip4/<公网IP>/tcp/<端口>/p2p/<公网PeerID>/p2p-circuit/p2p/<自己的PeerID>`。序号更大的记录盖过只含内网地址的第一条。
-5. 另一台节点 `Resolve` 或 `Search` 读到这条地址，经公网节点把流转发进来。两边都开了打洞时，在这条中继连接上做 DCUtR，向对方的直连地址同时拨。打洞不成，这一次调用仍经中继完成。
+4. 预约成功后，中继地址留在 libp2p 自己的地址簿里。签名记录只含 UUID、公钥和 `peer_id`。
+5. 另一台节点 `Resolve` 得到记录，用 `peer_id` 做 `FindPeer`，再按 libp2p 给出的地址拨号。两边都开了打洞时，在中继连接上做 DCUtR。打洞不成，这一次调用仍经中继完成。
 
 中继看得到谁在连谁，看不到 Noise 里面的帧。
 
-打洞走 UDP。需要打洞的进程监听 QUIC，例如 `/ip4/0.0.0.0/udp/0/quic-v1`。库的默认监听仍是 `/ip4/127.0.0.1/tcp/0`。只监听 TCP 时，调用可以经中继完成。
+打洞走 UDP。`cmd/kether` 把 TCP 和 QUIC 绑在 `0.0.0.0:4001`。`kagent` 在 NAT 上用临时端口的 TCP 和 QUIC。库的默认监听仍是 `/ip4/127.0.0.1/tcp/0`。只监听 TCP 时，调用可以经中继完成。
 
-`Connect` 先拨记录里的非 circuit 地址，失败再拨 circuit。拨通后立刻打开 `/kether/1.0.0`。打洞是异步的，已经握手的流留在拨通时的那条连接上。下一次新的 `Connect` 才会用上直连。
-
-### 写入记录的地址
-
-发布集合是操作员给出的 `Record.Addrs`，加上过滤后的宿主地址，去重，最多 8 条。操作员地址在前。
-
-过滤丢掉 `0.0.0.0` 和 `::`。`auto` 保留 `127.0.0.1`，本地测试继续直连。`private` 一旦有了 circuit 地址，就丢掉回环和内网地址。过滤结果为空时沿用上一条已发布的地址，不发布空地址。
-
-不另设 libp2p 地址工厂。过滤只发生在签名之前。
-
-订阅宿主地址更新和可达性变化。过滤后的集合与上次签进记录的不同，才递增 `seq` 并发布。集合相同则不动。TTL 刷新继续递增 `seq`，并走同一套过滤。订阅在拨种子之前装上；拨种子返回后再比对一次。
+`Connect` 把 `FindPeer` 得到的非 circuit 地址排在 circuit 前面。拨通后立刻打开 `/kether/1.0.0`。打洞是异步的，已经握手的流留在拨通时的那条连接上。下一次新的 `Connect` 才会用上直连。
 
 UPnP 不在本设计内。
 
-`cmd/kagent` 的公网与 NAT 操作见 [kagent.md](kagent.md)。
+`cmd/kether` 与 `cmd/kagent` 的操作见 [kagent.md](kagent.md)。
 
 ## 签名记录
 
@@ -178,7 +165,7 @@ UPnP 不在本设计内。
 
 ```text
 Record
-  uint32   version = 1
+  uint32   version = 2
   bytes    pubkey              // 32 字节约 x-only
   string   peer_id             // libp2p Peer ID 文本
   uint64   seq                 // 同一 ID 下单调递增，数值大的记录胜出
@@ -186,9 +173,9 @@ Record
   string   name                // 可选，最长 64 字节，只用于展示
   repeated string types        // 最多 8 个
   uint32   access              // 0 public，1 grant_only
-  repeated string addrs        // multiaddr，最多 8 个
   repeated PayMethod pay       // 最多 4 个
   bytes    signature           // BIP340，64 字节
+  string   uuid                // 8-4-4-4-12，字段号 12
 ```
 
 `PayMethod`：
@@ -205,18 +192,18 @@ PayMethod
 签名输入：
 
 ```text
-ASCII("kether/record/v1") || 0x00 || CanonicalRecordBytes
+ASCII("kether/record/v2") || 0x00 || CanonicalRecordBytes
 ```
 
-`CanonicalRecordBytes` 是 `signature` 置空后的 protobuf 确定性编码。验签公钥必须等于 `pubkey`，且 `pubkey` 编码出的 Agent ID 必须等于 DHT 键里的那个 ID。
+`CanonicalRecordBytes` 是 `signature` 置空后的 protobuf 确定性编码。验签公钥必须等于 `pubkey`。`uuid` 必须等于 DHT 键里的那个 ID。
 
 验证一条记录时全部满足才采纳：
 
-- 版本为 1，签名通过。
+- 版本为 2，签名通过。
+- `uuid` 是小写的 `8-4-4-4-12`。
 - `seq` 不低于该 ID 已经见过的序号。序号相等时，保留先到的一条。
 - `expires_at` 晚于本地时间减去 120 秒。
 - `peer_id` 能解析，且与 `pubkey` 导出的 Peer ID 一致。
-- `addrs` 非空。
 
 过期记录不再当作在线。发布者在过期前刷新，并递增 `seq`。
 
@@ -310,9 +297,9 @@ Envelope
 
 握手：
 
-1. 调用方按记录里的 multiaddr 拨号，先试非 circuit 地址，再试 circuit 地址。拨通后打开 `/kether/1.0.0`。经中继拨通时，这一条流留在中继上。
+1. 调用方用记录里的 `peer_id` 做 `FindPeer`，先试非 circuit 地址，再试 circuit 地址。拨通后打开 `/kether/1.0.0`。经中继拨通时，这一条流留在中继上。
 2. 双方发送 `Hello`：本方 Agent ID、32 字节随机数、对 `ASCII("kether/hello/v1") || 对方出现在记录中的 Agent ID || 双方随机数` 的 BIP340 签名。调用方在收到服务方随机数后补发签名；实现上服务方先发 `Hello`，调用方回 `Hello` 与对服务方随机数的签名，服务方再发 `HelloAck`。
-3. 双方检查对端公钥、Agent ID、Peer ID 与用来拨号的那条记录一致。
+3. 调用方检查对端 UUID、公钥、Peer ID 与用来拨号的记录一致。服务方用连接上的公钥验签，再按 Hello 里的 UUID 读取记录并核对 `peer_id`。
 4. 失败则发送 `Error` 并关闭流。同一 Host 上的后续调用可以复用已经握手成功的流，每条调用使用新的 `corr_id`。
 
 `Invoke`：
@@ -451,7 +438,7 @@ node.Handle(func(ctx context.Context, call kether.Call) (kether.Result, error) {
 
 `Connect` 内部 `Resolve`，拨号，完成握手。`Invoke` 在收到 `PayChallenge` 时调用配置的 `Payer`。
 
-`ID()` 返回本节点的 `keth1...`。`Close` 停止刷新并关闭 Host。
+`ID()` 返回本节点的 UUID。`Close` 停止刷新并关闭 Host。
 
 ## 仓库布局
 
@@ -474,10 +461,10 @@ kether/
 
 ## 安全
 
-- **冒充。** 记录、授权、握手都验 BIP340。拨号地址来自验签后的记录，握手再核对公钥和 Peer ID。攻击者可以在 DHT 里写入垃圾，写不了别人的 ID。
+- **冒充。** 记录、授权、握手都验 BIP340。拨号地址来自 `FindPeer`，握手再核对 UUID、公钥和 Peer ID 与验签后的记录一致。攻击者可以在 DHT 里写入垃圾，写不了别人的密钥签过的 UUID。
 - **重放。** 调用 nonce 在服务端去重。支付挑战单次有效，链上地址用后作废。
 - **过期与回滚。** 同一 ID 只接受更高的 `seq`。过期记录不可拨号。
-- **隐藏节点。** DHT 被遮蔽时，`Resolve` 失败或拿到旧记录。旧记录过期后自然失效。调用方收到的地址仍必须通过签名检查。
+- **隐藏节点。** DHT 被遮蔽时，`Resolve` 失败或拿到旧记录。旧记录过期后自然失效。拨号用的 `peer_id` 仍必须通过签名检查。
 - **类型冒充。** 搜索不保证能力真实。调用方按 Agent ID 决定是否连接。
 - **公开调用的滥用。** `public` 且 `pay` 非空时，未付款的请求停在支付步骤。`pay` 为空的公开 Agent 自行接受免费调用的成本。
 - **授权外泄。** 授权绑定 grantee 公钥。偷到授权字节的第三方通不过握手。
@@ -511,9 +498,9 @@ kether/
 
 下面这些在本文已经定死，避免实现时另起一套：
 
-- 身份签名是 BIP340，ID 编码是 HRP `keth` 的 bech32m，版本字节 `0x00`。
-- 目录是协议前缀 `/kether/kad/1.0.0` 的私有 DHT，单值上限 8 KiB。
-- Agent ID 与 libp2p Peer ID 都写进记录，由同一公钥导出，握手时两边都核对。
+- 身份签名是 BIP340。人抄的 ID 是随机 UUID，和私钥一起放在 `0600` 文件里。
+- 目录是协议前缀 `/kether/kad/1.0.0` 的私有 DHT，单值上限 8 KiB。键是 `/kether/agent/1/<uuid>`。
+- 记录版本为 2，签名域是 `kether/record/v2`。正文含 `uuid` 和 `peer_id`，不含 multiaddr。握手时两边都核对。
 - `grant_only` 不写入类型索引。
 - 处理函数只在授权和支付都通过之后运行。
 - 第一段代码的授权撤销靠 `not_after`，不靠额外的撤销网络。

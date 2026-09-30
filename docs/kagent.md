@@ -1,84 +1,53 @@
-# kagent：公网种子与 NAT 主机
+# kagent：一个 UUID 入网
 
-本页是 [设计](design.md) 里「公网可达性」的操作步骤，对应 [0012](issues/0012-nat.md)。`serve` 用 `--public` 声明公网种子，用 `--seed` 拨入；`ask` 用 `--id` 指定要调用的 Agent。
+本页是 [设计](design.md) 里身份和「公网可达性」的操作步骤，对应 [0014](issues/0014-relay.md)。公网中继是 [`cmd/kether`](../cmd/kether)。人要保存和传递的是 Agent 的 UUID。种子只配置中继的 `host:port`。
 
-每台机器使用固定的 `--key`。省略 `--key` 时每次启动都会生成新密钥，Peer ID 会变，已经写进 `--seed` 的地址失效。密钥文件权限为 `0600`。
+每台机器使用固定的 `--key`。省略 `--key` 时每次启动都会生成新密钥和新 UUID。密钥文件权限为 `0600`，里面是 32 字节私钥和 16 字节 UUID。
 
-示例里的 `203.0.113.10` 和 `203.0.113.11` 换成公网节点自己的地址。`--echo` 让服务方原样返回正文，演示不需要模型密钥。
+示例里的 `203.0.113.10` 换成公网中继自己的地址。`--echo` 让服务方原样返回正文，演示不需要模型密钥。
 
-成功时标准输出先有一行 `id keth1...`，然后每个已发布地址一行 `addr ...`。地址集合变化后再打印新的 `addr` 行。`id` 是 Agent ID。种子要用整行 `addr`，其中已经包含 `/p2p/<PeerID>`。
-
-## 一台公网种子
-
-公网 IP 配在本机网卡上时，直接监听该地址。打印出的 `addr` 就是 NAT 主机的 `--seed`。
-
-```bash
-go run -C cmd/kagent . serve --echo --public --key vps1.key \
-  --listen /ip4/203.0.113.10/tcp/4001 \
-  --listen /ip4/203.0.113.10/udp/4001/quic-v1
-```
-
-防火墙放行 TCP `4001` 和 UDP `4001`。
-
-公网 IP 不在本机网卡上时，监听所有地址，并用 `--announce` 公布公网 IP。未写 `/p2p/` 时，程序补上本机 Peer ID：
-
-```bash
-go run -C cmd/kagent . serve --echo --public --key vps1.key \
-  --listen /ip4/0.0.0.0/tcp/4001 \
-  --listen /ip4/0.0.0.0/udp/4001/quic-v1 \
-  --announce /ip4/203.0.113.10/tcp/4001 \
-  --announce /ip4/203.0.113.10/udp/4001/quic-v1
-```
-
-下面把打印出的 TCP 那一行记为 `<vps1>`。它的形态是：
+`kagent serve` 成功时标准输出只有一行：
 
 ```text
-/ip4/203.0.113.10/tcp/4001/p2p/<VPS1的PeerID>
+uuid 01234567-89ab-4cde-8fab-0123456789ab
 ```
 
-## 第二台公网种子
+## 一台公网中继
 
-第二台把第一台写进 `--seed`，并同样标成 `--public`。两台都要长期运行，路由表才是一张。
+`kether` 默认监听 `0.0.0.0:4001` 的 TCP 和 QUIC，打开 AutoNAT 回拨和 circuit 中继。防火墙放行这两个端口。标准输出一行 `listen 0.0.0.0:4001`。
 
 ```bash
-go run -C cmd/kagent . serve --echo --public --key vps2.key \
-  --seed <vps1> \
-  --listen /ip4/203.0.113.11/tcp/4001 \
-  --listen /ip4/203.0.113.11/udp/4001/quic-v1
+go run ./cmd/kether --key vps.key
 ```
 
-把它的 TCP `addr` 行记为 `<vps2>`。只有一台公网机器时，下面的命令只保留 `--seed <vps1>`。
+别的机器入网时，`--seed` 只写这台机器的 `host:port`，例如 `203.0.113.10:4001`。
+
+## 第二台公网中继
+
+多台中继不会自动互相发现。第二台把第一台写进 `--seed`。拨通之后两边在同一张 DHT 里。再加一台时，`--seed` 指向其中任意一台即可。
+
+```bash
+go run ./cmd/kether --key vps2.key --seed 203.0.113.10:4001
+```
+
+只有一台公网机器时，下面的命令只保留一个 `--seed`。NAT 节点把每一台中继都写进 `--seed`。
 
 ## NAT 上的服务方
 
-服务方不写 `--announce`，也不写 `--public`。监听 TCP 和 QUIC，种子列出每一台公网节点。
+`kagent` 不承担中继。程序自己监听临时端口上的 TCP 和 QUIC。种子列出每一台公网中继。
 
 ```bash
-go run -C cmd/kagent . serve --echo --key agent.key \
-  --seed <vps1> \
-  --seed <vps2> \
-  --listen /ip4/0.0.0.0/tcp/0 \
-  --listen /ip4/0.0.0.0/udp/0/quic-v1
+go run -C cmd/kagent . serve --echo --key agent.key --seed 203.0.113.10:4001
 ```
 
-入网后会再打印含 `p2p-circuit` 的 `addr` 行，形态是：
-
-```text
-/ip4/203.0.113.10/tcp/4001/p2p/<VPS1的PeerID>/p2p-circuit/p2p/<本机PeerID>
-```
-
-等到至少一行这样的地址出现，再从别处调用。同时记下 `id` 行的 `keth1...`，记为 `<agent>`。
+把打印出的那一行 UUID 记为 `<uuid>`。中继地址留在节点内部，不出现在输出里。中继发布的类型是 `relay`，`Search("agent")` 不会选中它。
 
 ## 从另一台 NAT 主机调用
 
-调用方把同一批公网地址当作 `--seed`，并用 `--id` 指定服务方。两台服务都会发布类型 `agent`，不写 `--id` 时 `Search` 可能打到公网种子自己。
+`--id` 是对方的 UUID。
 
 ```bash
-go run -C cmd/kagent . ask --key caller.key \
-  --seed <vps1> \
-  --seed <vps2> \
-  --id <agent> \
-  ping
+go run -C cmd/kagent . ask --key caller.key --seed 203.0.113.10:4001 --id <uuid> ping
 ```
 
 `--echo` 的服务方把正文原样返回，标准输出是：
@@ -87,4 +56,4 @@ go run -C cmd/kagent . ask --key caller.key \
 ping
 ```
 
-流量先经公网种子转发。两边都监听了 QUIC 时，程序会在这条中继连接上尝试打洞。打洞不成，这一次调用仍经种子完成。
+流量先经公网中继转发。两边都监听了 QUIC 时，程序会在这条中继连接上尝试打洞。打洞不成，这一次调用仍经中继完成。

@@ -128,32 +128,32 @@ func TestRelayHandshake(t *testing.T) {
 	}
 	defer c.Close()
 
-	deadline := time.Now().Add(20 * time.Second)
-	var published []string
-	for time.Now().Before(deadline) {
-		addrs := b.PublishedAddrs()
-		for _, addr := range addrs {
-			if strings.Contains(addr, "/p2p-circuit") {
-				published = addrs
-				break
-			}
-		}
-		if published != nil {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if published == nil {
-		t.Fatalf("no circuit address in %q", b.PublishedAddrs())
-	}
-
-	sess, err := c.Connect(ctx, b.ID())
+	blob, err := b.current().Marshal()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sess.Close()
-	remote := sess.s.Conn().RemoteMultiaddr().String()
-	if !strings.Contains(remote, "/p2p-circuit") {
-		t.Fatalf("connection %s", remote)
+	if strings.Contains(string(blob), "/ip4/") || strings.Contains(string(blob), "p2p-circuit") {
+		t.Fatal("record contains a multiaddr")
 	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	var sess *Session
+	for time.Now().Before(deadline) {
+		s, err := c.Connect(ctx, b.ID())
+		if err != nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		remote := s.s.Conn().RemoteMultiaddr().String()
+		if strings.Contains(remote, "/p2p-circuit") {
+			sess = s
+			break
+		}
+		_ = s.Close()
+		time.Sleep(50 * time.Millisecond)
+	}
+	if sess == nil {
+		t.Fatal("no circuit handshake")
+	}
+	defer sess.Close()
 }

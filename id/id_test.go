@@ -100,6 +100,66 @@ func TestSignVerify(t *testing.T) {
 	}
 }
 
+func TestUUIDFile(t *testing.T) {
+	k, err := id.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := id.ParseUUID(k.UUID()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := id.ParseUUID(strings.ToUpper(k.UUID())); err == nil {
+		t.Fatal("expected lowercase uuid")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "key")
+	if err := k.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) != 48 {
+		t.Fatalf("len %d", len(b))
+	}
+	if err := os.WriteFile(path, b[:32], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := id.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := id.ParseUUID(loaded.UUID()); err != nil {
+		t.Fatal(err)
+	}
+	again, err := id.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.UUID() != loaded.UUID() {
+		t.Fatal("uuid changed on reload")
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != 48 || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("file %d %o", fi.Size(), fi.Mode().Perm())
+	}
+	got, err := loaded.Public().PeerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := k.Public().PeerID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatal("peer id changed")
+	}
+}
+
 func TestKeyFileMode(t *testing.T) {
 	k, err := id.Generate()
 	if err != nil {

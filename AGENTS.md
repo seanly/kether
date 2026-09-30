@@ -7,7 +7,7 @@
 
 ## 状态
 
-0001–0012 已完成：身份、签名记录、入网、发现、握手、授权、Lightning 与链上 Bitcoin 打桩支付、调用状态机、`cmd/twonode`、公网可达性（AutoNAT、中继、打洞）。
+0001–0014 已完成：身份、签名记录、入网、发现、握手、授权、Lightning 与链上 Bitcoin 打桩支付、调用状态机、`cmd/twonode`、公网可达性（AutoNAT、中继、打洞）、UUID 入网、独立公网中继 `cmd/kether`。
 
 ## 快速开始
 
@@ -22,7 +22,7 @@ go test ./cmd/twonode
 
 ## 心智模型
 
-1. **启动即入网。** `Start` 用 secp256k1 密钥导出 `keth1…` Agent ID，拨配置里的种子，发布签名记录，并按 TTL 的一半刷新。
+1. **启动即入网。** `Start` 用密钥文件里的 UUID 作为 Agent ID，拨配置里的 `host:port` 种子，发布签名记录，并按 TTL 的一半刷新。
 2. **发现有两条路。** `Resolve(id)` 按 Agent ID 取最新验签记录。`Search(type)` 只返回 `public` 且声明了该类型的 Agent。
 3. **先验证再执行。** `grant_only` 必须带对该 ID 签发的授权。记录标了价就必须先通过支付回执。`Handle` 只在这两步通过之后运行。
 
@@ -32,7 +32,7 @@ go test ./cmd/twonode
 
 | 包 | 职责 |
 |---|---|
-| `id` | 密钥、bech32m Agent ID（HRP `keth`）、BIP340 |
+| `id` | 密钥、UUID、BIP340。bech32m（HRP `keth`）仍可从公钥导出 |
 | `record` | 签名记录的编码与验签 |
 | `dht` | DHT 键与 namespace validator |
 | `node` | `Start`、发布、搜索、连接、调用 |
@@ -41,6 +41,7 @@ go test ./cmd/twonode
 | `pay` | 支付接口、`MemLightning`、`MemChain` |
 | `frame` | 长度前缀帧，上限 1 MiB |
 | `cmd/twonode` | 本地双路径演示。库不反向依赖它 |
+| `cmd/kether` | 公网中继。监听 `0.0.0.0:4001`，类型 `relay`。库不反向依赖它 |
 
 ## 常见任务
 
@@ -50,7 +51,7 @@ go test ./cmd/twonode
 | 看某段是否已交付 | [`docs/issues/README.md`](docs/issues/README.md) 的状态列，再打开对应 issue |
 | 嵌入宿主 | 根包 `kether.Start`。业务只注册 `Handle` |
 | 本地跑通公开与仅授权 | `cmd/twonode` |
-| 公网种子与 NAT 主机 | [`docs/design.md`](docs/design.md) 的「公网可达性」，操作见 [`docs/kagent.md`](docs/kagent.md) |
+| 公网中继与 NAT 主机 | [`docs/kagent.md`](docs/kagent.md)。中继是 `cmd/kether`，Agent 是 `cmd/kagent` |
 
 ## 约定
 

@@ -2,7 +2,6 @@ package node
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -107,13 +106,13 @@ func TestUnreachableSeed(t *testing.T) {
 
 func TestRecordTooBig(t *testing.T) {
 	ctx := testCtx(t)
-	fat := make([]string, 8)
-	for i := range fat {
-		fat[i] = fmt.Sprintf("/ip4/127.0.0.1/tcp/%d/p2p/%s", i+1, strings.Repeat("a", 1200))
-	}
 	_, err := Start(ctx, Config{
-		Key:    mustKey(t),
-		Record: Record{Types: []string{"echo"}, Addrs: fat},
+		Key: mustKey(t),
+		Record: Record{
+			Types: []string{"echo"},
+			Pay:   []PayMethod{{Rail: "lightning", Hint: strings.Repeat("h", 9000), Amount: 1}},
+		},
+		Payee: pay.NewMemLightning(),
 	})
 	if err == nil {
 		t.Fatal("expected size error")
@@ -275,11 +274,17 @@ func TestPeerMismatch(t *testing.T) {
 	}
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := frame.Read(s); err != nil {
+	envHello, err := frame.Read(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonceC := make([]byte, 32)
+	sig, err := id.Sign(c.key, id.DomainHello, helloMaterial(envHello.Hello.AgentID, envHello.Hello.Nonce, nonceC))
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := frame.Write(s, &frame.Envelope{Kind: frame.KindHello, Hello: frame.Hello{
-		AgentID: other.ID(), Nonce: make([]byte, 32), Signature: make([]byte, 64),
+		AgentID: other.ID(), Nonce: nonceC, Signature: sig,
 	}}); err != nil {
 		t.Fatal(err)
 	}

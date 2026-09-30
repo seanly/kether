@@ -22,7 +22,6 @@ func sample(t *testing.T, exp time.Time) (*id.PrivateKey, *record.Record) {
 		Name:      "echo",
 		Types:     []string{"echo"},
 		Access:    record.AccessPublic,
-		Addrs:     []string{"/ip4/127.0.0.1/tcp/1/p2p/placeholder"},
 		Pay:       []record.PayMethod{{Rail: "lightning", Amount: 1000}},
 	}
 	if err := record.Sign(k, r); err != nil {
@@ -32,7 +31,7 @@ func sample(t *testing.T, exp time.Time) (*id.PrivateKey, *record.Record) {
 }
 
 func TestRoundTrip(t *testing.T) {
-	_, r := sample(t, time.Now().Add(time.Hour))
+	k, r := sample(t, time.Now().Add(time.Hour))
 	b1, err := r.Marshal()
 	if err != nil {
 		t.Fatal(err)
@@ -50,6 +49,13 @@ func TestRoundTrip(t *testing.T) {
 	}
 	if err := got.Verify(time.Now()); err != nil {
 		t.Fatal(err)
+	}
+	if strings.Contains(string(b1), "/ip4/") || strings.Contains(string(b1), "p2p-circuit") {
+		t.Fatal("record contains a multiaddr")
+	}
+	aid, err := got.AgentID()
+	if err != nil || aid != k.UUID() {
+		t.Fatalf("id %q err %v", aid, err)
 	}
 }
 
@@ -69,17 +75,19 @@ func TestMeta(t *testing.T) {
 	bad := &record.Record{
 		Seq: 1, ExpiresAt: time.Now().Add(time.Hour).Unix(),
 		Types: []string{"BAD"},
-		Addrs: []string{"/ip4/127.0.0.1/tcp/1"},
 	}
 	if err := record.Sign(k, bad); err == nil {
 		t.Fatal("expected bad type")
 	}
-	empty := &record.Record{
+	ok := &record.Record{
 		Seq: 1, ExpiresAt: time.Now().Add(time.Hour).Unix(),
 		Types: []string{"echo"},
 	}
-	if err := record.Sign(k, empty); err == nil {
-		t.Fatal("expected empty addrs")
+	if err := record.Sign(k, ok); err != nil {
+		t.Fatal(err)
+	}
+	if ok.UUID != k.UUID() {
+		t.Fatalf("uuid %s", ok.UUID)
 	}
 }
 
@@ -119,13 +127,10 @@ func TestTooBig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addrs := make([]string, 8)
-	for i := range addrs {
-		addrs[i] = "/ip4/127.0.0.1/tcp/1/p2p/" + strings.Repeat("a", 1200)
-	}
 	r := &record.Record{
 		Seq: 1, ExpiresAt: time.Now().Add(time.Hour).Unix(),
-		Types: []string{"echo"}, Addrs: addrs,
+		Types: []string{"echo"},
+		Pay:   []record.PayMethod{{Rail: "lightning", Hint: strings.Repeat("h", 9000), Amount: 1}},
 	}
 	if err := record.Sign(k, r); err != nil {
 		t.Fatal(err)

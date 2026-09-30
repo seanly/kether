@@ -10,7 +10,6 @@ import (
 
 	"github.com/libp2p/go-libp2p"
 	kaddht "github.com/libp2p/go-libp2p-kad-dht"
-	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
@@ -37,13 +36,12 @@ type PayMethod struct {
 	Amount uint64
 }
 
-// Record is the record published at start. Addresses come from the host when empty.
+// Record is the record published at start.
 type Record struct {
 	Name   string
 	Types  []string
 	Access Access
 	Pay    []PayMethod
-	Addrs  []string
 }
 
 type Config struct {
@@ -57,9 +55,6 @@ type Config struct {
 	TTL        time.Duration
 	// Reachability selects public relay, private NAT, or automatic behavior.
 	Reachability Reachability
-	// OnAddrs is called when the published address set changes after the first publish.
-	// It must not call Close.
-	OnAddrs func([]string)
 }
 
 type Peer struct {
@@ -67,7 +62,6 @@ type Peer struct {
 	Name      string
 	Types     []string
 	Access    Access
-	Addrs     []string
 	Pay       []PayMethod
 	Seq       uint64
 	ExpiresAt time.Time
@@ -144,6 +138,13 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 	if len(cfg.Listen) == 0 {
 		cfg.Listen = []string{"/ip4/127.0.0.1/tcp/0"}
 	}
+	if len(cfg.Seeds) > 0 {
+		seeds, err := normalizeSeeds(ctx, cfg.Key, cfg.Seeds)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Seeds = seeds
+	}
 	lp, err := cfg.Key.Libp2p()
 	if err != nil {
 		return nil, err
@@ -165,17 +166,11 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		h.Close()
 		return nil, err
 	}
-	aid, err := cfg.Key.Public().AgentID()
-	if err != nil {
-		kd.Close()
-		h.Close()
-		return nil, err
-	}
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	n := &Node{
 		cfg:     cfg,
 		key:     cfg.Key,
-		agentID: aid,
+		agentID: cfg.Key.UUID(),
 		host:    h,
 		dht:     kd,
 		ctx:     runCtx,
@@ -188,19 +183,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		n.shutdown()
 		return nil, err
 	}
-	addrSub, err := h.EventBus().Subscribe(new(event.EvtLocalAddressesUpdated))
-	if err != nil {
-		n.shutdown()
-		return nil, err
-	}
-	reachSub, err := h.EventBus().Subscribe(new(event.EvtLocalReachabilityChanged))
-	if err != nil {
-		addrSub.Close()
-		n.shutdown()
-		return nil, err
-	}
-	started := make(chan struct{})
-	go n.refresh(addrSub, reachSub, started)
+	go n.refresh()
 	fail := func(err error) (*Node, error) {
 		n.cancel()
 		<-n.exited
@@ -216,19 +199,10 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 	if err := n.publish(ctx); err != nil {
 		return fail(err)
 	}
-	close(started)
 	return n, nil
 }
 
 func (n *Node) signLocked(now time.Time) error {
-	var previous []string
-	if n.rec != nil {
-		previous = n.rec.Addrs
-	}
-	addrs := chooseAddrs(n.cfg.Reachability, n.cfg.Record.Addrs, n.Addrs(), previous)
-	if len(addrs) == 0 {
-		return errors.New("kether: record has no address")
-	}
 	pay := make([]record.PayMethod, len(n.cfg.Record.Pay))
 	for i, p := range n.cfg.Record.Pay {
 		pay[i] = record.PayMethod{Rail: p.Rail, Hint: p.Hint, Amount: p.Amount}
@@ -239,7 +213,6 @@ func (n *Node) signLocked(now time.Time) error {
 		Name:      n.cfg.Record.Name,
 		Types:     append([]string(nil), n.cfg.Record.Types...),
 		Access:    uint32(n.cfg.Record.Access),
-		Addrs:     addrs,
 		Pay:       pay,
 	}
 	if err := record.Sign(n.key, rec); err != nil {
@@ -324,67 +297,33 @@ func (n *Node) dialSeeds(ctx context.Context) error {
 	return nil
 }
 
-func (n *Node) refresh(addrSub, reachSub event.Subscription, started <-chan struct{}) {
+func (n *Node) refresh() {
 	defer close(n.exited)
-	defer addrSub.Close()
-	defer reachSub.Close()
 	interval := n.cfg.TTL / 2
 	if interval < time.Second {
 		interval = time.Second
 	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	arm := started
 	for {
 		select {
 		case <-n.ctx.Done():
 			return
-		case <-arm:
-			arm = nil
-			n.republishIfChanged()
-		case <-addrSub.Out():
-			if arm == nil {
-				n.republishIfChanged()
-			}
-		case <-reachSub.Out():
-			if arm == nil {
-				n.republishIfChanged()
-			}
 		case <-t.C:
-			if arm != nil {
-				continue
-			}
 			n.bumpAndPublish()
 		}
 	}
 }
 
-// republishIfChanged signs and publishes only when the address set differs.
-func (n *Node) republishIfChanged() {
-	n.mu.Lock()
-	previous := append([]string(nil), n.rec.Addrs...)
-	next := chooseAddrs(n.cfg.Reachability, n.cfg.Record.Addrs, n.Addrs(), previous)
-	n.mu.Unlock()
-	if sameAddrs(previous, next) {
-		return
-	}
-	n.bumpAndPublish()
-}
-
 func (n *Node) bumpAndPublish() {
 	n.mu.Lock()
-	before := append([]string(nil), n.rec.Addrs...)
 	n.seq++
 	err := n.signLocked(time.Now())
-	after := append([]string(nil), n.rec.Addrs...)
 	n.mu.Unlock()
 	if err != nil {
 		return
 	}
 	_ = n.publish(n.ctx)
-	if n.cfg.OnAddrs != nil && !sameAddrs(before, after) {
-		n.cfg.OnAddrs(after)
-	}
 }
 
 func (n *Node) Close() error {
@@ -407,15 +346,6 @@ func (n *Node) shutdown() error {
 }
 
 func (n *Node) ID() string { return n.agentID }
-
-// PublishedAddrs returns the addresses in the current signed record.
-func (n *Node) PublishedAddrs() []string {
-	rec := n.current()
-	if rec == nil {
-		return nil
-	}
-	return append([]string(nil), rec.Addrs...)
-}
 
 func (n *Node) Addrs() []string {
 	if n.host == nil {
@@ -440,24 +370,39 @@ func (n *Node) current() *record.Record {
 	return n.rec
 }
 
-func (n *Node) Resolve(ctx context.Context, agentID string) (Peer, error) {
+func (n *Node) lookup(ctx context.Context, agentID string) (*record.Record, error) {
+	if _, err := id.ParseUUID(agentID); err != nil {
+		return nil, errors.New("kether: agent id")
+	}
 	if agentID == n.agentID {
-		return peerFrom(n.current()), nil
+		rec := n.current()
+		if rec == nil {
+			return nil, errors.New("kether: no record")
+		}
+		return rec, nil
 	}
 	val, err := n.dht.GetValue(ctx, dht.AgentKey(agentID))
 	if err != nil {
-		return Peer{}, err
+		return nil, err
 	}
 	rec, err := record.Unmarshal(val)
 	if err != nil {
-		return Peer{}, err
+		return nil, err
 	}
 	if err := rec.Verify(time.Now()); err != nil {
-		return Peer{}, err
+		return nil, err
 	}
 	got, err := rec.AgentID()
 	if err != nil || got != agentID {
-		return Peer{}, errors.New("kether: record agent id mismatch")
+		return nil, errors.New("kether: record agent id mismatch")
+	}
+	return rec, nil
+}
+
+func (n *Node) Resolve(ctx context.Context, agentID string) (Peer, error) {
+	rec, err := n.lookup(ctx, agentID)
+	if err != nil {
+		return Peer{}, err
 	}
 	return peerFrom(rec), nil
 }
@@ -529,13 +474,17 @@ func peerFrom(rec *record.Record) Peer {
 	}
 	return Peer{
 		ID: aid, Name: rec.Name, Types: append([]string(nil), rec.Types...),
-		Access: Access(rec.Access), Addrs: append([]string(nil), rec.Addrs...),
-		Pay: pay, Seq: rec.Seq, ExpiresAt: time.Unix(rec.ExpiresAt, 0),
+		Access: Access(rec.Access),
+		Pay:    pay, Seq: rec.Seq, ExpiresAt: time.Unix(rec.ExpiresAt, 0),
 	}
 }
 
 func (n *Node) Grant(granteeID string, scope Scope) (Grant, error) {
-	pub, err := id.ParseAgentID(granteeID)
+	rec, err := n.lookup(n.ctx, granteeID)
+	if err != nil {
+		return nil, err
+	}
+	pub, err := id.ParseXOnly(rec.Pubkey)
 	if err != nil {
 		return nil, err
 	}

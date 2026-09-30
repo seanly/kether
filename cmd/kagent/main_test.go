@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"net"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/seanly/kether"
+	"github.com/seanly/kether/id"
 )
 
 func TestEchoTwoNodes(t *testing.T) {
@@ -19,7 +21,7 @@ func TestEchoTwoNodes(t *testing.T) {
 	}
 	defer srv.Close()
 
-	body, err := callAgent(ctx, "", srv.Node.Addrs(), "", "ping")
+	body, err := callAgent(ctx, "", []string{hostPort(t, srv.Node)}, "", "ping")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +46,7 @@ func TestSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	asker, err := startClient(ctx, key, srv.Node.Addrs())
+	asker, err := startClient(ctx, key, []string{hostPort(t, srv.Node)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,8 +73,8 @@ func TestSearch(t *testing.T) {
 			if len(p.Types) != 1 || p.Types[0] != "agent" {
 				t.Fatalf("types %q", p.Types)
 			}
-			if len(p.Addrs) == 0 {
-				t.Fatal("no addrs")
+			if _, err := id.ParseUUID(p.ID); err != nil {
+				t.Fatal(err)
 			}
 		}
 		if found {
@@ -95,68 +97,16 @@ func TestSearch(t *testing.T) {
 	}
 }
 
-func TestAnnouncePassedThrough(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	const ann = "/ip4/203.0.113.5/tcp/4001/p2p/announce"
-	srv, err := startServer(ctx, serveConfig{Echo: true, Announce: []string{ann}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer srv.Close()
-
-	key, err := loadKey("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	asker, err := startClient(ctx, key, srv.Node.Addrs())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer asker.Close()
-	peer, err := findAgent(ctx, asker)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if peer.ID != srv.Node.ID() {
-		t.Fatalf("found %s", peer.ID)
-	}
-	if len(peer.Addrs) == 0 || peer.Addrs[0] != ann {
-		t.Fatalf("addrs %q", peer.Addrs)
-	}
-}
-
-func TestAnnounceAddsPeerID(t *testing.T) {
-	key, err := loadKey("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := completeAnnounce(key, []string{"/ip4/203.0.113.5/tcp/4001"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	pid, err := key.Public().PeerID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "/ip4/203.0.113.5/tcp/4001/p2p/" + pid.String()
-	if len(got) != 1 || got[0] != want {
-		t.Fatalf("announce %q", got)
-	}
-}
-
 func TestServeSeedAndAskID(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
-	seed, err := startServer(ctx, serveConfig{Echo: true, Public: true})
+	seed, err := startServer(ctx, serveConfig{Echo: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer seed.Close()
-	if len(seed.Node.Addrs()) == 0 {
-		t.Fatal("seed has no address")
-	}
-	other, err := startServer(ctx, serveConfig{Echo: true, Seeds: seed.Node.Addrs()})
+	hp := hostPort(t, seed.Node)
+	other, err := startServer(ctx, serveConfig{Echo: true, Seeds: []string{hp}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +114,7 @@ func TestServeSeedAndAskID(t *testing.T) {
 	other.Node.Handle(func(_ context.Context, c kether.Call) (kether.Result, error) {
 		return kether.Result{Body: []byte("from-other")}, nil
 	})
-	body, err := callAgent(ctx, "", seed.Node.Addrs(), other.Node.ID(), "ping")
+	body, err := callAgent(ctx, "", []string{hp}, other.Node.ID(), "ping")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,11 +125,27 @@ func TestServeSeedAndAskID(t *testing.T) {
 
 func TestWriteReady(t *testing.T) {
 	var buf bytes.Buffer
-	if err := writeReady(&buf, "keth1example", []string{"/ip4/127.0.0.1/tcp/1/p2p/peer"}); err != nil {
+	const uuid = "11111111-1111-4111-8111-111111111111"
+	if err := writeReady(&buf, uuid); err != nil {
 		t.Fatal(err)
 	}
 	got := buf.String()
-	if !strings.Contains(got, "id keth1example\n") || !strings.Contains(got, "addr /ip4/127.0.0.1/tcp/1/p2p/peer\n") {
+	if got != "uuid "+uuid+"\n" {
 		t.Fatalf("output %q", got)
 	}
+	if strings.Contains(got, "addr ") {
+		t.Fatalf("output %q", got)
+	}
+}
+
+func hostPort(t *testing.T, n *kether.Node) string {
+	t.Helper()
+	for _, raw := range n.Addrs() {
+		parts := strings.Split(raw, "/")
+		if len(parts) >= 5 && parts[1] == "ip4" && parts[3] == "tcp" {
+			return net.JoinHostPort(parts[2], parts[4])
+		}
+	}
+	t.Fatal("no tcp address")
+	return ""
 }

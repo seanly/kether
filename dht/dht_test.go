@@ -18,7 +18,6 @@ func signed(t *testing.T, exp time.Time, seq uint64) []byte {
 	r := &record.Record{
 		Seq: seq, ExpiresAt: exp.Unix(), Name: "echo",
 		Types: []string{"echo"}, Access: record.AccessPublic,
-		Addrs: []string{"/ip4/127.0.0.1/tcp/9"},
 	}
 	if err := record.Sign(k, r); err != nil {
 		t.Fatal(err)
@@ -70,7 +69,7 @@ func TestSelectKeepsEarlierOnEqualSeq(t *testing.T) {
 	mk := func(seq uint64, name string) []byte {
 		r := &record.Record{
 			Seq: seq, ExpiresAt: time.Now().Add(time.Hour).Unix(), Name: name,
-			Types: []string{"echo"}, Addrs: []string{"/ip4/127.0.0.1/tcp/9"},
+			Types: []string{"echo"},
 		}
 		if err := record.Sign(k, r); err != nil {
 			t.Fatal(err)

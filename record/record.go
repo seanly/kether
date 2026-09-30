@@ -25,34 +25,35 @@ type PayMethod struct {
 	Amount uint64
 }
 
+const Version = 2
+
 type Record struct {
 	Version   uint32
 	Pubkey    []byte
 	PeerID    string
+	UUID      string
 	Seq       uint64
 	ExpiresAt int64
 	Name      string
 	Types     []string
 	Access    uint32
-	Addrs     []string
 	Pay       []PayMethod
 	Signature []byte
 }
 
 func (r *Record) AgentID() (string, error) {
-	pub, err := id.ParseXOnly(r.Pubkey)
-	if err != nil {
+	if _, err := id.ParseUUID(r.UUID); err != nil {
 		return "", err
 	}
-	return pub.AgentID()
+	return r.UUID, nil
 }
 
 func (r *Record) ValidateMeta() error {
-	if r.Version == 0 {
-		r.Version = 1
-	}
-	if r.Version != 1 {
+	if r.Version != Version {
 		return errors.New("record: version")
+	}
+	if _, err := id.ParseUUID(r.UUID); err != nil {
+		return errors.New("record: uuid")
 	}
 	if len(r.Name) > 64 {
 		return errors.New("record: name too long")
@@ -70,9 +71,6 @@ func (r *Record) ValidateMeta() error {
 		}
 		seen[typ] = struct{}{}
 	}
-	if len(r.Addrs) == 0 || len(r.Addrs) > 8 {
-		return errors.New("record: addrs")
-	}
 	if len(r.Pay) > 4 {
 		return errors.New("record: pay")
 	}
@@ -80,7 +78,8 @@ func (r *Record) ValidateMeta() error {
 }
 
 func Sign(priv *id.PrivateKey, r *Record) error {
-	r.Version = 1
+	r.Version = Version
+	r.UUID = priv.UUID()
 	r.Pubkey = priv.Public().XOnly()
 	pid, err := priv.Public().PeerID()
 	if err != nil {
@@ -100,7 +99,7 @@ func Sign(priv *id.PrivateKey, r *Record) error {
 }
 
 func (r *Record) Verify(now time.Time) error {
-	if r.Version != 1 {
+	if r.Version != Version {
 		return errors.New("record: version")
 	}
 	if err := r.ValidateMeta(); err != nil {
@@ -157,12 +156,10 @@ func (r *Record) marshalBody() []byte {
 		b = pbuf.AppendString(b, 7, typ)
 	}
 	b = pbuf.AppendVarint(b, 8, uint64(r.Access))
-	for _, addr := range r.Addrs {
-		b = pbuf.AppendString(b, 9, addr)
-	}
 	for _, pay := range r.Pay {
 		b = pbuf.AppendBytes(b, 10, pay.marshal())
 	}
+	b = pbuf.AppendString(b, 12, r.UUID)
 	return b
 }
 
@@ -202,8 +199,6 @@ func Unmarshal(b []byte) (*Record, error) {
 			r.Types = append(r.Types, string(f.Bytes))
 		case 8:
 			r.Access = uint32(f.Varint)
-		case 9:
-			r.Addrs = append(r.Addrs, string(f.Bytes))
 		case 10:
 			pm, err := unmarshalPay(f.Bytes)
 			if err != nil {
@@ -212,6 +207,8 @@ func Unmarshal(b []byte) (*Record, error) {
 			r.Pay = append(r.Pay, pm)
 		case 11:
 			r.Signature = f.Bytes
+		case 12:
+			r.UUID = string(f.Bytes)
 		default:
 			return nil, fmt.Errorf("record: unknown field %d", f.Num)
 		}

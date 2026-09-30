@@ -1,10 +1,13 @@
 package id
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -16,15 +19,19 @@ import (
 const (
 	hrp             = "keth"
 	versionByte     = 0x00
-	DomainRecord    = "kether/record/v1"
+	DomainRecord    = "kether/record/v2"
 	DomainGrant     = "kether/grant/v1"
 	DomainHello     = "kether/hello/v1"
 	DomainChallenge = "kether/challenge/v1"
+	secretLen       = btcec.PrivKeyBytesLen
+	keyFileLen      = secretLen + 16
 )
 
-// PrivateKey is the agent's secp256k1 key. It never appears in logs from this package.
+// PrivateKey is the agent's secp256k1 key and the UUID written into its record.
+// The secret never appears in logs from this package.
 type PrivateKey struct {
-	k *btcec.PrivateKey
+	k    *btcec.PrivateKey
+	uuid [16]byte
 }
 
 // Public is the corresponding public key.
@@ -37,7 +44,16 @@ func Generate() (*PrivateKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &PrivateKey{k: evenY(k)}, nil
+	u, err := newUUID()
+	if err != nil {
+		return nil, err
+	}
+	return &PrivateKey{k: evenY(k), uuid: u}, nil
+}
+
+// UUID is the canonical 8-4-4-4-12 identifier stored with this key.
+func (k *PrivateKey) UUID() string {
+	return formatUUID(k.uuid)
 }
 
 // evenY negates the secret when the public Y coordinate is odd so the
@@ -60,15 +76,19 @@ func (k *PrivateKey) Libp2p() (crypto.PrivKey, error) {
 	return crypto.UnmarshalSecp256k1PrivateKey(k.k.Serialize())
 }
 
-// Save writes the 32-byte secret with mode 0600.
+// Save writes the 32-byte secret and 16-byte UUID with mode 0600.
 func (k *PrivateKey) Save(path string) error {
-	if err := os.WriteFile(path, k.k.Serialize(), 0o600); err != nil {
+	buf := make([]byte, keyFileLen)
+	copy(buf, k.k.Serialize())
+	copy(buf[secretLen:], k.uuid[:])
+	if err := os.WriteFile(path, buf, 0o600); err != nil {
 		return err
 	}
 	return os.Chmod(path, 0o600)
 }
 
 // Load reads a private key and rejects files other users can access.
+// A 32-byte file from an older build gains a UUID and is rewritten in place.
 func Load(path string) (*PrivateKey, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -81,11 +101,65 @@ func Load(path string) (*PrivateKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(b) != btcec.PrivKeyBytesLen {
+	switch len(b) {
+	case secretLen:
+		u, err := newUUID()
+		if err != nil {
+			return nil, err
+		}
+		k, _ := btcec.PrivKeyFromBytes(b)
+		key := &PrivateKey{k: evenY(k), uuid: u}
+		if err := key.Save(path); err != nil {
+			return nil, err
+		}
+		return key, nil
+	case keyFileLen:
+		k, _ := btcec.PrivKeyFromBytes(b[:secretLen])
+		var u [16]byte
+		copy(u[:], b[secretLen:])
+		if _, err := ParseUUID(formatUUID(u)); err != nil {
+			return nil, errors.New("id: invalid uuid")
+		}
+		return &PrivateKey{k: evenY(k), uuid: u}, nil
+	default:
 		return nil, errors.New("id: invalid private key length")
 	}
-	k, _ := btcec.PrivKeyFromBytes(b)
-	return &PrivateKey{k: evenY(k)}, nil
+}
+
+func newUUID() ([16]byte, error) {
+	var u [16]byte
+	if _, err := rand.Read(u[:]); err != nil {
+		return u, err
+	}
+	u[6] = (u[6] & 0x0f) | 0x40
+	u[8] = (u[8] & 0x3f) | 0x80
+	return u, nil
+}
+
+func formatUUID(u [16]byte) string {
+	h := hex.EncodeToString(u[:])
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// ParseUUID accepts the canonical lowercase 8-4-4-4-12 form.
+func ParseUUID(s string) ([16]byte, error) {
+	var out [16]byte
+	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
+		return out, errors.New("id: uuid")
+	}
+	raw := s[0:8] + s[9:13] + s[14:18] + s[19:23] + s[24:36]
+	if strings.ToLower(raw) != raw {
+		return out, errors.New("id: uuid")
+	}
+	b, err := hex.DecodeString(raw)
+	if err != nil || len(b) != 16 {
+		return out, errors.New("id: uuid")
+	}
+	if b[6]&0xf0 != 0x40 || b[8]&0xc0 != 0x80 {
+		return out, errors.New("id: uuid")
+	}
+	copy(out[:], b)
+	return out, nil
 }
 
 func (p *Public) XOnly() []byte {
